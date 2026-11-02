@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UnitV2 Thermal</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c3038; --text:#e6e8eb; --dim:#8a919c; --accent:#ff7a3d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif; }
+  .wrap { display:grid; grid-template-columns: minmax(0,1fr) 320px; gap:16px; padding:16px; max-width:1200px; margin:0 auto; }
+  @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } }
+  .view { position:relative; }
+  .view img { width:100%; display:block; background:#000; border-radius:8px; aspect-ratio:4/3; }
+  .stats { color:var(--dim); font:12px ui-monospace, monospace; margin-top:8px; white-space:pre-wrap; }
+  .hint { color:var(--dim); font-size:12px; margin-top:8px; }
+  kbd { background:var(--panel); border:1px solid var(--line); border-radius:3px; padding:0 4px; font-size:11px; }
+  details { background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:10px; }
+  summary { padding:10px 12px; cursor:pointer; font-weight:600; }
+  .body { padding:2px 12px 12px; }
+  .row { display:grid; grid-template-columns: 110px 1fr 52px; align-items:center; gap:8px; margin:6px 0; }
+  .row label { color:var(--dim); }
+  .row output { text-align:right; font:12px ui-monospace, monospace; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  select, input[type=text], input[type=number] { width:100%; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:4px; }
+  .btns { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  button { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:5px 10px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  #msg { min-height:1.4em; color:var(--accent); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="view">
+    <img id="stream" src="/stream" alt="thermal overlay stream">
+    <div class="stats" id="stats">…</div>
+    <div class="hint">Calibrate: point at a warm object 1–2 m away. <kbd>←↑→↓</kbd> move, <kbd>+</kbd>/<kbd>−</kbd> scale,
+      <kbd>Shift</kbd> = fine, <kbd>H</kbd>/<kbd>V</kbd> flip, <kbd>O</kbd> outline.</div>
+  </div>
+  <div id="panel">
+    <div id="msg"></div>
+  </div>
+</div>
+<script>
+// Control definitions: [key, label, type, min, max, step]
+const GROUPS = [
+  ["Overlay", true, [
+    ["alpha", "Opacity", "range", 0, 1, 0.01],
+    ["colormap", "Palette", "choice"],
+    ["interp", "Smoothing", "choice"],
+    ["hot_only", "Hot only", "bool"],
+    ["hot_threshold", "Hot ≥ °C", "range", 0, 100, 0.5],
+  ]],
+  ["Temperature range", true, [
+    ["range_mode", "Mode", "choice"],
+    ["t_min", "Min °C", "range", -20, 100, 0.5],
+    ["t_max", "Max °C", "range", -20, 150, 0.5],
+    ["min_span", "Min span", "range", 0.5, 20, 0.5],
+    ["range_smooth", "Auto smooth", "range", 0.02, 1, 0.01],
+  ]],
+  ["Alignment", true, [
+    ["scale_x", "Scale X", "range", 0.2, 3, 0.005],
+    ["scale_y", "Scale Y", "range", 0.2, 3, 0.005],
+    ["off_x", "Offset X", "range", -1, 1, 0.002],
+    ["off_y", "Offset Y", "range", -1, 1, 0.002],
+    ["flip_h", "Mirror H", "bool"],
+    ["flip_v", "Flip V", "bool"],
+    ["show_outline", "Outline", "bool"],
+  ]],
+  ["Display", false, [
+    ["show_hud", "HUD", "bool"],
+    ["jpeg_quality", "JPEG quality", "range", 30, 95, 1],
+    ["max_fps", "Max fps", "range", 1, 30, 1],
+  ]],
+  ["Sensor", false, [
+    ["serial_dev", "UART device", "text"],
+    ["serial_baud", "UART baud", "text"],
+    ["checksum", "Checksum", "choice"],
+    ["thermal_timeout", "Timeout s", "range", 0.5, 10, 0.5],
+  ]],
+];
+
+let cfg = {}, choices = {}, pending = {}, timer = null;
+const msg = t => { document.getElementById("msg").textContent = t; };
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+function queue(key, value) {
+  pending[key] = value; cfg[key] = value;
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    const send = pending; pending = {};
+    try { await api("/api/config", send); msg(""); } catch (e) { msg("Error: " + e.message); }
+  }, 120);
+}
+
+function fmt(v) { return typeof v === "number" ? (Math.abs(v) < 10 ? v.toFixed(3).replace(/\.?0+$/, "") || "0" : v.toFixed(1)) : v; }
+
+function build() {
+  const panel = document.getElementById("panel");
+  for (const [title, open, items] of GROUPS) {
+    const d = document.createElement("details"); d.open = open;
+    d.innerHTML = `<summary>${title}</summary><div class="body"></div>`;
+    const body = d.querySelector(".body");
+    for (const [key, label, type, min, max, step] of items) {
+      const row = document.createElement("div"); row.className = "row";
+      row.innerHTML = `<label for="c_${key}">${label}</label>`;
+      let el, out = document.createElement("output");
+      if (type === "range") {
+        el = Object.assign(document.createElement("input"), { type: "range", min, max, step });
+        el.oninput = () => { const v = parseFloat(el.value); out.textContent = fmt(v); queue(key, v); };
+      } else if (type === "bool") {
+        el = Object.assign(document.createElement("input"), { type: "checkbox" });
+        el.style.justifySelf = "start";
+        el.onchange = () => queue(key, el.checked);
+      } else if (type === "choice") {
+        el = document.createElement("select");
+        for (const c of choices[key] || []) el.add(new Option(c, c));
+        el.onchange = () => queue(key, el.value);
+      } else {
+        el = Object.assign(document.createElement("input"), { type: "text" });
+        el.onchange = () => queue(key, el.value);
+      }
+      el.id = "c_" + key; el.dataset.key = key; el.dataset.type = type;
+      row.append(el, out); body.append(row);
+    }
+    if (title === "Sensor") {
+      const b = document.createElement("div"); b.className = "btns";
+      b.innerHTML = `<span style="color:var(--dim);align-self:center">Module rate:</span>` +
+        [1, 2, 4, 8].map(h => `<button data-rate="${h}">${h} Hz</button>`).join("") +
+        `<button data-baud="460800">→ 460800 baud</button><button data-baud="115200">→ 115200 baud</button>` +
+        `<button data-save="1">Save to module</button>`;
+      b.onclick = async e => {
+        const t = e.target.dataset; let body = null;
+        if (t.rate) body = { rate: +t.rate };
+        if (t.baud) body = { baud: +t.baud };
+        if (t.save) body = { save: true };
+        if (!body) return;
+        try { const r = await api("/api/mlx", body); msg("Sent: " + r.sent.join(", ")); if (t.baud) await load(); }
+        catch (err) { msg("Error: " + err.message); }
+      };
+      body.append(b);
+    }
+    panel.append(d);
+  }
+}
+
+function sync() {
+  for (const el of document.querySelectorAll("[data-key]")) {
+    const v = cfg[el.dataset.key];
+    if (el.dataset.type === "bool") el.checked = !!v; else el.value = v;
+    const out = el.parentElement.querySelector("output");
+    if (out && el.dataset.type === "range") out.textContent = fmt(v);
+  }
+}
+
+async function load() {
+  const j = await api("/api/config");
+  cfg = j.config; choices = j.choices;
+  if (!document.querySelector("[data-key]")) build();
+  sync();
+}
+
+async function pollStats() {
+  try {
+    const s = await api("/api/stats"), t = s.thermal || {};
+    let txt = `out ${s.out_fps} fps · viewers ${s.viewers}\n` +
+      `thermal ${t.dev} @ ${t.baud || "-"}: ${t.fps} fps, ok ${t.frames_ok ?? "-"}, bad ${t.frames_bad ?? "-"}` +
+      (t.error ? `\n⚠ ${t.error}` : "");
+    if (s.camera) txt += `\ncamera ${s.camera.src}: ${s.camera.fps} fps` + (s.camera.error ? ` ⚠ ${s.camera.error}` : "");
+    document.getElementById("stats").textContent = txt;
+  } catch (e) { document.getElementById("stats").textContent = "stats unavailable: " + e.message; }
+}
+
+// Keyboard calibration.
+document.addEventListener("keydown", e => {
+  if (e.target.matches("input[type=text], select")) return;
+  const fine = e.shiftKey ? 0.2 : 1, d = 0.01 * fine, s = 0.02 * fine;
+  const bump = (k, dv, lo, hi) => { queue(k, Math.min(hi, Math.max(lo, +(cfg[k] + dv).toFixed(4)))); sync(); };
+  switch (e.key) {
+    case "ArrowLeft":  bump("off_x", -d, -1, 1); break;
+    case "ArrowRight": bump("off_x",  d, -1, 1); break;
+    case "ArrowUp":    bump("off_y", -d, -1, 1); break;
+    case "ArrowDown":  bump("off_y",  d, -1, 1); break;
+    case "+": case "=": bump("scale_x", s, 0.2, 3); bump("scale_y", s, 0.2, 3); break;
+    case "-": case "_": bump("scale_x", -s, 0.2, 3); bump("scale_y", -s, 0.2, 3); break;
+    case "h": case "H": queue("flip_h", !cfg.flip_h); sync(); break;
+    case "v": case "V": queue("flip_v", !cfg.flip_v); sync(); break;
+    case "o": case "O": queue("show_outline", !cfg.show_outline); sync(); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+
+load().catch(e => msg("Cannot load config: " + e.message));
+pollStats(); setInterval(pollStats, 2000);
+</script>
+</body>
+</html>

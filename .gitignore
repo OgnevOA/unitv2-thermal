@@ -1,0 +1,4 @@
+__pycache__/
+thermal/config.json
+thermal/config.json.*
+*.tmp
