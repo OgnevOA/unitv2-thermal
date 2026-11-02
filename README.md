@@ -115,6 +115,26 @@ The final scale also tells you which lens your sensor has:
 
 The **amb** value in the HUD is the module's own temperature, warmed by its electronics, not the room.
 
+## Drawing: on the UnitV2 or in the browser
+
+The switch under the video picks who draws the overlay. Each device remembers its own choice, and
+`?draw=browser` / `?draw=server` in the URL sets it too.
+
+| | **UnitV2** (default) | **This browser** |
+|---|---|---|
+| What is sent | one finished MJPEG stream (`/stream`) | the plain camera (`/camera`) + temperatures (`/api/thermal/stream`) |
+| UnitV2 CPU | composites and re-encodes every frame (~5.5 fps) | passes camera JPEGs through, no compositing |
+| Video rate | ~5.5 fps | up to **Max fps** (Display panel) |
+| Works in | everything that shows MJPEG (Home Assistant, VLC, …) | browsers |
+
+Both use the same settings, geometry and palettes (`/api/palettes` is generated from OpenCV's colour maps),
+so they look the same. In browser mode, settings changes show instantly.
+
+Camera pass-through needs OpenCV to hand out the camera's raw MJPEG frames. The stats line shows
+`camera … (raw)` when it does. Otherwise it shows `(decoded)`, and frames are decoded and encoded once each,
+which still saves the compositing. Raw frames from USB cameras usually lack JPEG Huffman tables. The server
+adds the standard ones so browsers can decode them.
+
 ## Speed and delay
 
 | | measured on this build |
@@ -205,10 +225,13 @@ enough, but check them if you use a different board or brick.
 | Endpoint | |
 |---|---|
 | `GET /` | control page |
-| `GET /stream` | MJPEG stream |
+| `GET /stream` | MJPEG stream with the overlay drawn by the UnitV2 |
+| `GET /camera` | plain camera MJPEG (browser-side drawing), capped at `max_fps` |
+| `GET /api/thermal/stream` | server-sent events, one per thermal frame: `{"seq", "amb", "age", "t": [768 × °C·100]}` |
+| `GET /api/palettes` | the colour maps as `{name: [r, g, b, …] × 256}` |
 | `GET /snapshot.jpg` | single JPEG |
 | `GET /api/config`, `POST /api/config` | read / change settings (JSON) |
-| `GET /api/stats` | fps, frame counters, errors |
+| `GET /api/stats` | fps, frame counters, errors, camera mode (`raw`/`decoded`), viewers per mode |
 | `GET /api/thermal` | latest 24×32 temperature grid (°C) |
 | `POST /api/mlx` | `{"rate": 4}`, `{"baud": 460800}`, `{"save": true}` |
 

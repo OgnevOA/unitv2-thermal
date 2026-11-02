@@ -155,17 +155,84 @@ class Config(object):
 # Sources
 # ---------------------------------------------------------------------------
 
+_DHT = None
+
+
+def standard_dht():
+    """The default JPEG Huffman tables (DHT segments), taken from a JPEG OpenCV just encoded:
+    libjpeg writes the standard tables unless told to optimise."""
+    global _DHT
+    if _DHT is None:
+        img = np.zeros((16, 16, 3), np.uint8)
+        img[:, :8] = (40, 200, 90)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        data, segs, i = buf.tobytes(), [], 2
+        while i + 4 <= len(data) and data[i] == 0xFF:
+            m = data[i + 1]
+            if m == 0xDA:
+                break
+            n = (data[i + 2] << 8) | data[i + 3]
+            if m == 0xC4:
+                segs.append(data[i:i + 2 + n])
+            i += 2 + n
+        _DHT = b"".join(segs)
+    return _DHT
+
+
+def fix_mjpeg(data):
+    """Turn one camera MJPEG frame into a standalone JPEG, or None if it isn't one.
+
+    UVC cameras usually leave out the Huffman tables (MJPEG implies the standard ones);
+    browsers then refuse the image, so they are inserted before the scan. Bytes after
+    the end-of-image marker (driver buffer padding) are dropped.
+    """
+    if data[:2] != b"\xff\xd8":
+        return None
+    end = data.rfind(b"\xff\xd9")
+    if end > 0:
+        data = data[:end + 2]
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        m = data[i + 1]
+        if m == 0xFF:                      # fill byte
+            i += 1
+            continue
+        if m == 0xC4:                      # has its own tables
+            return data
+        if m == 0xDA:                      # start of scan: tables go right before it
+            return data[:i] + standard_dht() + data[i:]
+        if m == 0x01 or 0xD0 <= m <= 0xD8:  # markers without a length
+            i += 2
+            continue
+        i += 2 + ((data[i + 2] << 8) | data[i + 3])
+    return data
+
+
 class Camera(threading.Thread):
+    """Grabs camera frames while someone needs them.
+
+    Preferred mode "raw": the camera's own MJPEG frames are kept as JPEG bytes, so
+    /camera (browser-side drawing) costs no decoding or encoding at all; frames are
+    decoded only when the server-side renderer asks for them. If OpenCV can't hand
+    out raw MJPEG, mode "decoded": frames are decoded as before and JPEG-encoded
+    only when /camera asks. Either conversion happens once per frame, shared.
+    """
+
     def __init__(self, src, width, height):
         super(Camera, self).__init__(name="camera")
         self.daemon = True
         self.src, self.width, self.height = src, width, height
         self.cond = threading.Condition()
-        self.frame, self.seq = None, 0
+        self._cur = (0, None, None)        # (seq, decoded frame or None, jpeg bytes or None)
+        self._lazy = threading.Lock()
+        self.seq = 0
         self.fps = 0.0
         self.error = None
+        self.mode = None                   # "raw" / "decoded" once the first frame arrived
+        self.quality = 70                  # for encoding in "decoded" mode
         self.active = threading.Event()   # set while someone needs frames
         self._reopen = threading.Event()
+        self._try_raw = True
 
     def reconfigure(self, src=None, width=None, height=None):
         if src is not None:
@@ -174,50 +241,119 @@ class Camera(threading.Thread):
             self.width = width
         if height:
             self.height = height
+        self._try_raw = True
         self._reopen.set()
 
-    def wait_frame(self, last_seq, timeout=1.0):
+    # -- consumers ------------------------------------------------------------
+    def _wait(self, last_seq, timeout):
         with self.cond:
             if self.seq == last_seq:
                 self.cond.wait(timeout)
-            return self.frame, self.seq
+            return self._cur
+
+    def _fill(self, cur, want):
+        """Decode or encode the missing representation of `cur`, once, and cache it."""
+        seq, frame, jpeg = cur
+        if (want == "frame" and frame is not None) or (want == "jpeg" and jpeg is not None):
+            return frame if want == "frame" else jpeg
+        with self._lazy:
+            with self.cond:
+                if self._cur[0] == seq:
+                    seq, frame, jpeg = self._cur      # another thread may have filled it
+            if want == "frame" and frame is None and jpeg is not None:
+                frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None and (frame.shape[1], frame.shape[0]) != (self.width, self.height):
+                    frame = cv2.resize(frame, (self.width, self.height))
+            elif want == "jpeg" and jpeg is None and frame is not None:
+                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.quality)])
+                jpeg = buf.tobytes() if ok else None
+            with self.cond:
+                if self._cur[0] == seq:
+                    self._cur = (seq, frame, jpeg)
+        return frame if want == "frame" else jpeg
+
+    def wait_frame(self, last_seq, timeout=1.0):
+        """-> (BGR frame or None, seq) for the server-side renderer."""
+        cur = self._wait(last_seq, timeout)
+        return (self._fill(cur, "frame") if cur[0] else None), cur[0]
+
+    def wait_jpeg(self, last_seq, timeout=1.0):
+        """-> (JPEG bytes or None, seq) for /camera."""
+        cur = self._wait(last_seq, timeout)
+        return (self._fill(cur, "jpeg") if cur[0] else None), cur[0]
+
+    # -- capture --------------------------------------------------------------
+    def _open(self, raw):
+        cap = cv2.VideoCapture(self.src)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # fewer queued driver buffers = fresher frames
+        if raw:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # V4L2 backend: hand out the undecoded buffer
+        return cap
+
+    def _publish(self, frame, jpeg):
+        with self.cond:
+            self.seq += 1
+            self._cur = (self.seq, frame, jpeg)
+            self.cond.notify_all()
 
     def run(self):
         while True:
             self._reopen.clear()
-            cap = cv2.VideoCapture(self.src)
-            if not cap.isOpened():
+            raw = self._try_raw
+            cap = self._open(raw)
+            if cap is None:
                 self.error = "cannot open camera %r" % (self.src,)
-                cap.release()
                 time.sleep(2.0)
                 continue
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # fewer queued driver buffers = fresher frames
             self.error = None
+            mode = None
             last = None
             fails = 0
             while not self._reopen.is_set():
                 if not self.active.wait(0.5):
                     continue          # nobody watching: leave the camera idle
-                ok, frame = cap.read()
-                if not ok or frame is None:
+                ok, f = cap.read()
+                if not ok or f is None:
                     fails += 1
                     if fails > 20:
                         self.error = "camera read failing"
+                        if raw and mode is None:
+                            self._try_raw = False      # raw mode never produced a frame
                         break
                     time.sleep(0.05)
                     continue
                 fails = 0
-                if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
+                if mode is None:
+                    flat = f.reshape(-1)
+                    if raw and f.ndim <= 2 and f.dtype == np.uint8 and flat[:2].tobytes() == b"\xff\xd8":
+                        mode = "raw"
+                    elif raw:
+                        # Decoded anyway, or raw but not JPEG: reopen the classic way, so the
+                        # camera keeps the pixel format OpenCV picks by itself.
+                        self._try_raw = False
+                        break
+                    else:
+                        mode = "decoded"
+                    self.mode = mode
+                if mode == "raw":
+                    jpeg = fix_mjpeg(f.reshape(-1).tobytes())
+                    if jpeg is None:
+                        continue
+                    self._publish(None, jpeg)
+                else:
+                    if f.shape[1] != self.width or f.shape[0] != self.height:
+                        f = cv2.resize(f, (self.width, self.height))
+                    self._publish(f, None)
                 now = time.time()
                 if last:
                     self.fps = 0.9 * self.fps + 0.1 / max(now - last, 1e-3)
                 last = now
-                with self.cond:
-                    self.frame, self.seq = frame, self.seq + 1
-                    self.cond.notify_all()
             cap.release()
             time.sleep(0.5)
 
@@ -267,7 +403,8 @@ class App(object):
         self.comp_lock = threading.Lock()
         self.hub = threading.Condition()
         self.jpeg, self.jpeg_seq = None, 0
-        self.viewers = 0
+        self.viewers = 0             # /stream (server-side drawing)
+        self.camera_viewers = 0      # /camera (browser-side drawing)
         self.want_until = 0.0        # keep rendering until this time (snapshots)
         self.out_fps = 0.0
 
@@ -294,25 +431,30 @@ class App(object):
             self.camera.reconfigure(c["camera"], c["width"], c["height"])
 
     def stats(self):
-        s = {"thermal": self.thermal.stats(), "out_fps": round(self.out_fps, 1), "viewers": self.viewers}
+        s = {"thermal": self.thermal.stats(), "out_fps": round(self.out_fps, 1), "viewers": self.viewers,
+             "camera_viewers": self.camera_viewers}
         if self.camera:
-            s["camera"] = {"fps": round(self.camera.fps, 1), "error": self.camera.error, "src": self.camera.src}
+            s["camera"] = {"fps": round(self.camera.fps, 1), "error": self.camera.error, "src": self.camera.src,
+                           "mode": self.camera.mode}
         return s
 
     def run(self):
         cam_seq = 0
         last_out = None
         while True:
-            if not self.active():
-                if self.camera:
+            serve = self.active()
+            if self.camera:
+                if serve or self.camera_viewers > 0:
+                    self.camera.active.set()
+                else:
                     self.camera.active.clear()
-                time.sleep(0.1)
+            if not serve:
+                time.sleep(0.1)   # browser-side drawing only: no compositing here at all
                 continue
             loop_start = time.time()
             c = self.cfg.snapshot()
             frame = None
             if self.camera:
-                self.camera.active.set()
                 frame, cam_seq = self.camera.wait_frame(cam_seq, timeout=1.0)
             if frame is None:
                 # No camera (or not ready): thermal on a grey canvas so bring-up still works.
@@ -353,6 +495,13 @@ class App(object):
 # HTTP
 # ---------------------------------------------------------------------------
 
+def palettes():
+    """{name: [r, g, b] * 256}, straight from cv2.applyColorMap, so browser-side drawing matches."""
+    grad = np.arange(256, dtype=np.uint8).reshape(256, 1)
+    return {name: cv2.applyColorMap(grad, cm)[:, 0, ::-1].reshape(-1).tolist()
+            for name, cm in overlay.COLORMAPS.items()}
+
+
 STREAM_SNDBUF = 16384   # bytes; Linux doubles it. Keeps the stream from queueing old frames.
 
 
@@ -363,6 +512,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 def make_handler(app):
     index_path = os.path.join(HERE, "static", "index.html")
+    palette_json = json.dumps(palettes(), separators=(",", ":"))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "UnitV2Thermal/1.0"
@@ -395,6 +545,12 @@ def make_handler(app):
                     self._send(200, f.read(), "text/html; charset=utf-8")
             elif path == "/stream":
                 self._stream()
+            elif path == "/camera":
+                self._camera_stream()
+            elif path == "/api/thermal/stream":
+                self._thermal_events()
+            elif path == "/api/palettes":
+                self._send(200, palette_json, "application/json")
             elif path == "/snapshot.jpg":
                 app.demand(2.0)
                 jpg, _ = app.wait_jpeg(app.jpeg_seq, timeout=3.0)
@@ -459,20 +615,84 @@ def make_handler(app):
                 sent.append("baud %d (UnitV2 side switched too)" % baud)
             return {"ok": True, "sent": sent}
 
-        def _stream(self):
+        def _small_sndbuf(self):
             # Keep the kernel send buffer to about one frame. Left alone, TCP auto-tuning grows
             # it to megabytes: on a slow WiFi link that queues many seconds of old frames.
-            # With a small buffer, write() blocks instead, and the next wait_jpeg() skips
-            # straight to the newest frame, so delay stays at about one frame's transfer time.
+            # With a small buffer, write() blocks instead, and the next wait skips straight
+            # to the newest frame, so delay stays at about one frame's transfer time.
             try:
                 self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STREAM_SNDBUF)
                 self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
+
+        def _mjpeg_headers(self):
+            self._small_sndbuf()
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+
+        def _write_part(self, jpg):
+            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                             + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+
+        def _camera_stream(self):
+            """Plain camera MJPEG for browser-side drawing, capped at max_fps."""
+            if app.camera is None:
+                self._send(404, {"error": "no camera (--no-camera)"})
+                return
+            self._mjpeg_headers()
+            with app.hub:
+                app.camera_viewers += 1
+            seq, next_t = 0, 0.0
+            try:
+                while True:
+                    c = app.cfg.snapshot()
+                    app.camera.quality = c["jpeg_quality"]
+                    wait = next_t - time.time()
+                    if wait > 0:
+                        time.sleep(wait)
+                    jpg, seq2 = app.camera.wait_jpeg(seq, timeout=2.0)
+                    if jpg is None or seq2 == seq:
+                        continue
+                    seq = seq2
+                    next_t = time.time() + 1.0 / max(c["max_fps"], 1.0)
+                    self._write_part(jpg)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                with app.hub:
+                    app.camera_viewers -= 1
+
+        def _thermal_events(self):
+            """Server-sent events: one message per new thermal frame (temperatures in 1/100 degC)."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            last_seq, last_write = None, time.time()
+            try:
+                while True:
+                    th = app.thermal.latest()
+                    now = time.time()
+                    if th is not None and th[3] != last_seq:
+                        last_seq = th[3]
+                        msg = json.dumps({
+                            "seq": th[3], "amb": round(float(th[1]), 2), "age": round(now - th[2], 2),
+                            "t": np.round(th[0] * 100).astype(np.int32).reshape(-1).tolist(),
+                        }, separators=(",", ":"))
+                        self.wfile.write(("data: %s\n\n" % msg).encode())
+                        last_write = now
+                    elif now - last_write > 10:
+                        self.wfile.write(b": keep-alive\n\n")
+                        last_write = now
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def _stream(self):
+            self._mjpeg_headers()
             with app.hub:
                 app.viewers += 1
             seq = 0
@@ -482,8 +702,7 @@ def make_handler(app):
                     if jpg is None or seq2 == seq:
                         continue
                     seq = seq2
-                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                                     + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                    self._write_part(jpg)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
