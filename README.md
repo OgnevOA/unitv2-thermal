@@ -17,7 +17,7 @@ through `termios` and the web server is `http.server`, so nothing needs `pip ins
 
 | Connection | Address |
 |---|---|
-| Home WiFi | **http://192.168.1.112:8080** (IP reserved on the router for MAC `00:e0:4c:e1:94:c5`) |
+| Home WiFi | **http://&lt;unitv2-ip&gt;:8080**. Run `./deploy.sh pin-mac` once, then reserve an IP for that MAC on your router, so the address stays the same. |
 | USB-C cable to a phone or computer | **http://10.254.239.1:8080** (see [Phone over USB](#phone-over-usb)) |
 | The UnitV2's own WiFi hotspot | **http://10.254.239.1:8080** |
 
