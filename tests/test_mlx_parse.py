@@ -109,8 +109,12 @@ class ParserTests(unittest.TestCase):
 class CommandTests(unittest.TestCase):
     def test_command_checksums(self):
         self.assertEqual(m.CMD_SAVE, bytes([0xA5, 0x65, 0x01, 0x0B]))
-        self.assertEqual(m.cmd_baud(115200), bytes([0xA5, 0x15, 0x01, 0xBB]))
-        self.assertEqual(m.cmd_baud(460800), bytes([0xA5, 0x15, 0x02, 0xBC]))
+        # GY-MCU90640 user manual V1.0, section IV.4
+        self.assertEqual(m.cmd_baud(9600), bytes([0xA5, 0x15, 0x01, 0xBB]))
+        self.assertEqual(m.cmd_baud(115200), bytes([0xA5, 0x15, 0x02, 0xBC]))
+        self.assertEqual(m.cmd_baud(460800), bytes([0xA5, 0x15, 0x03, 0xBD]))
+        self.assertEqual(m.CMD_QUERY, bytes([0xA5, 0x35, 0x01, 0xDB]))
+        self.assertEqual(m.CMD_START, bytes([0xA5, 0x35, 0x02, 0xDC]))
 
 
 if __name__ == "__main__":
@@ -124,7 +128,7 @@ class AutoBaudTests(unittest.TestCase):
         import threading
         import time
 
-        module_baud = 115200          # what the fake module really talks at
+        module_baud = 9600            # what the fake module really talks at
         frame = make_frame(gradient())
         opened = []                   # bauds the reader tried, in order
         stop = threading.Event()
@@ -149,7 +153,8 @@ class AutoBaudTests(unittest.TestCase):
         orig_open, orig_hunt = m.open_serial, m.MLXReader.BAUD_HUNT_S
         m.open_serial, m.MLXReader.BAUD_HUNT_S = fake_open, 0.3
         try:
-            rd = m.MLXReader("/dev/fake", baud=460800, auto_bauds=(115200, 460800))
+            rd = m.MLXReader("/dev/fake", baud=115200, auto_bauds=(115200, 460800, 9600))
+            rd._hunt_s = lambda: 0.3
             rd.start()
             deadline = time.time() + 5
             while rd.latest() is None and time.time() < deadline:
@@ -159,10 +164,10 @@ class AutoBaudTests(unittest.TestCase):
             stop.set()
             m.open_serial, m.MLXReader.BAUD_HUNT_S = orig_open, orig_hunt
         self.assertIsNotNone(rd.latest(), "no frame after falling back")
-        self.assertEqual(opened[:2], [460800, 115200])
-        self.assertEqual(rd.baud, 115200)
+        self.assertEqual(opened[:3], [115200, 460800, 9600])
+        self.assertEqual(rd.baud, 9600)
 
-    def test_asks_module_back_to_home_baud(self):
+    def test_never_sends_baud_commands(self):
         import threading
         import time
         written = []
@@ -180,18 +185,22 @@ class AutoBaudTests(unittest.TestCase):
             threading.Thread(target=feed, daemon=True).start()
             return r
 
-        orig = (m.open_serial, m.MLXReader.BAUD_HUNT_S, m.os.write)
+        orig = (m.open_serial, m.os.write)
+        real_write = os.write
         def spy_write(fd, data):
             written.append(bytes(data))
-            return len(data)
-        m.open_serial, m.MLXReader.BAUD_HUNT_S = fake_open, 0.2
-        m.os.write = spy_write
+            return real_write(fd, data) if len(data) > 4 else len(data)
+        m.open_serial, m.os.write = fake_open, spy_write
         try:
-            rd = m.MLXReader("/dev/fake", baud=460800, auto_bauds=(115200, 460800))
+            rd = m.MLXReader("/dev/fake", baud=460800, auto_bauds=(460800, 115200, 9600),
+                             init_cmds=[m.CMD_START])
+            rd._hunt_s = lambda: 0.15
             rd.start()
-            time.sleep(0.6)
+            time.sleep(0.8)
             rd.stop()
             time.sleep(0.3)
         finally:
-            m.open_serial, m.MLXReader.BAUD_HUNT_S, m.os.write = orig
-        self.assertIn(m.cmd_baud(115200), written)
+            m.open_serial, m.os.write = orig
+        cmds = [w for w in written if len(w) == 4 and w[0] == 0xA5]
+        self.assertTrue(cmds, "start command not sent")
+        self.assertTrue(all(c == m.CMD_START for c in cmds), cmds)

@@ -11,6 +11,7 @@ The parser itself is stdlib-only so tools/uart_probe.py works without numpy.
 """
 
 import os
+import sys
 import struct
 import threading
 import time
@@ -26,10 +27,13 @@ FRAME_LEN = 1544
 ROWS, COLS = 24, 32
 NPIX = ROWS * COLS
 
-# Module commands: A5 <cmd> <arg> <sum of first three bytes & 0xFF>.
-# Arg values below follow the vendor manual; confirm actual behaviour with tools/uart_probe.py.
+# Module commands: A5 <cmd> <arg> <sum of first three bytes & 0xFF>, from the GY-MCU90640
+# user manual V1.0 (section IV.4). Baud rate, rate and auto/query mode are applied from flash:
+# send the setting, then CMD_SAVE, then power-cycle the module (seen on the real module:
+# a new baud rate does not take effect before that). While the module is streaming at
+# 9600 baud it ignores incoming commands; put it in query mode first (CMD_QUERY).
 RATE_ARGS = {0.5: 0x00, 1: 0x01, 2: 0x02, 4: 0x03, 8: 0x04}
-BAUD_ARGS = {115200: 0x01, 460800: 0x02}
+BAUD_ARGS = {9600: 0x01, 115200: 0x02, 460800: 0x03}
 
 
 def make_cmd(cmd, arg):
@@ -45,9 +49,10 @@ def cmd_baud(baud):
 
 
 CMD_SAVE = make_cmd(0x65, 0x01)
-# Continuous output. Verified on the real module (A5 35 02 DC); sent on every port open,
-# because the module may power up waiting for it. Harmless when it is already streaming.
+# Automatic (continuous) output; sent on every port open, because the module may have been
+# saved in query mode. Harmless when it is already streaming.
 CMD_START = make_cmd(0x35, 0x02)
+CMD_QUERY = make_cmd(0x35, 0x01)   # query mode: the module stops streaming
 
 
 def word_checksum(frame):
@@ -164,22 +169,31 @@ def open_serial(dev, baud):
     return fd
 
 
+def _log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg)
+    sys.stdout.flush()
+
+
 class MLXReader(threading.Thread):
     """Background thread keeping the most recent valid thermal frame.
 
     Reconnects automatically if the port disappears or goes silent.
     """
 
-    # No valid frame for this long after opening: try the next baud rate in auto_bauds.
+    # No valid frame for this long after opening: try the next baud rate in auto_bauds
+    # (at least 2.5 frame transfer times, so a slow rate like 9600 gets its chance).
     BAUD_HUNT_S = 4.0
+
+    def _hunt_s(self):
+        return max(self.BAUD_HUNT_S, 2.5 * FRAME_LEN * 10.0 / max(self.baud, 1))
 
     def __init__(self, dev, baud=115200, checksum="word", init_cmds=(), auto_bauds=()):
         super(MLXReader, self).__init__(name="mlx-reader")
         self.daemon = True
         self.dev = dev
         self.baud = baud
-        # Baud rates to cycle through while no frames arrive, e.g. (115200, 460800). Covers a
-        # module that lost an unsaved baud change at power-off, or one the UART can't hear.
+        # Baud rates to cycle through while no frames arrive, e.g. (115200, 460800, 9600): the
+        # reader follows the module wherever it is. It never sends baud commands itself.
         self.auto_bauds = list(auto_bauds)
         self.checksum = checksum
         self.init_cmds = list(init_cmds)
@@ -239,22 +253,21 @@ class MLXReader(threading.Thread):
                     os.write(fd, c)
                     time.sleep(0.05)
                 self.error = None
-                if self._loop(fd) == "no frames" and self.auto_bauds:
-                    home = self.auto_bauds[0]
-                    if self.baud != home and self.baud in BAUD_ARGS and home in BAUD_ARGS:
-                        # The module may be at this rate while we can't receive it cleanly:
-                        # sending usually still works, so ask it to come back to `home`.
-                        try:
-                            os.write(fd, cmd_baud(home))
-                            time.sleep(0.1)
-                        except OSError:
-                            pass  # best effort: the fallback below must happen regardless
-                    others = [b for b in self.auto_bauds if b != self.baud] or self.auto_bauds
-                    nxt = others[0]
+                t0, self._rx_bytes, frames0 = time.monotonic(), 0, self.parser.frames_ok
+                outcome = self._loop(fd)
+                if outcome:
+                    # One line per failed open: the evidence when the sensor goes quiet.
+                    _log("serial %s @ %d: %s after %.1f s (%d bytes, %d frames)" % (
+                        self.dev, self.baud, outcome, time.monotonic() - t0,
+                        self._rx_bytes, self.parser.frames_ok - frames0))
+                if outcome == "no frames" and self.auto_bauds:
+                    i = self.auto_bauds.index(self.baud) if self.baud in self.auto_bauds else -1
+                    nxt = self.auto_bauds[(i + 1) % len(self.auto_bauds)]
                     self.error = "no frames at %d baud, trying %d" % (self.baud, nxt)
                     self.baud = nxt
             except Exception as e:  # noqa: BLE001 - keep thread alive, report the error
                 self.error = "%s: %s" % (type(e).__name__, e)
+                _log("serial %s @ %d: %s" % (self.dev, self.baud, self.error))
                 self._stop_evt.wait(1.0)
             finally:
                 if fd is not None:
@@ -262,24 +275,28 @@ class MLXReader(threading.Thread):
 
     def _loop(self, fd):
         """Read until stopped or reconfigured. Returns "no frames" if nothing valid arrives
-        within BAUD_HUNT_S of opening (when auto_bauds is set), "silent" after 10 s without
+        within _hunt_s() of opening (when auto_bauds is set), "silent" after 10 s without
         any bytes, else None."""
-        opened = last_rx = time.time()
+        # Timing uses the monotonic clock: the UnitV2 boots at 1970 and NTP later jumps the
+        # wall clock forward by decades. Frame timestamps stay wall-clock (the server compares them).
+        opened = last_rx = time.monotonic()
         last_frame_t = None
+        first = True
         while not (self._stop_evt.is_set() or self._reopen.is_set()):
             with self._lock:
                 writes, self._pending_writes = self._pending_writes, []
             for w in writes:
                 os.write(fd, w)
             chunk = os.read(fd, 4096)
-            now = time.time()
+            now = time.monotonic()
             if chunk:
                 last_rx = now
+                self._rx_bytes += len(chunk)
             elif now - last_rx > 10.0:
                 return "silent"  # reopen the port (error stays set)
             elif now - last_rx > 3.0:
                 self.error = "no data from %s for %.0f s" % (self.dev, now - last_rx)
-            if self.auto_bauds and last_frame_t is None and now - opened > self.BAUD_HUNT_S:
+            if self.auto_bauds and last_frame_t is None and now - opened > self._hunt_s():
                 return "no frames"
             for frame in self.parser.feed(chunk):
                 temps, amb = decode(frame)
@@ -289,6 +306,9 @@ class MLXReader(threading.Thread):
                         self.fps = 0.8 * self.fps + 0.2 * (1.0 / dt) if self.fps else 1.0 / dt
                 last_frame_t = now
                 self.error = None
+                if first:
+                    first = False
+                    _log("serial %s @ %d: frames after %.1f s" % (self.dev, self.baud, now - opened))
                 with self._lock:
                     self.seq += 1
-                    self._latest = (temps, amb, now, self.seq)
+                    self._latest = (temps, amb, time.time(), self.seq)

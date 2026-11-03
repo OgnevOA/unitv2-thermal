@@ -6,7 +6,7 @@ Examples (on the UnitV2):
     python3 uart_probe.py /dev/ttyS1 --scan           # try common baud rates
     python3 uart_probe.py /dev/ttyS1 --rate 4         # send "4 Hz" command, then measure
     python3 uart_probe.py /dev/ttyS1 --send A5250?    # raw command, '?' = auto checksum
-    python3 uart_probe.py /dev/ttyS1 --set-baud 460800 --save
+    python3 uart_probe.py /dev/ttyS1 --set-baud 460800   # saves; then power-cycle
 """
 
 import argparse
@@ -120,7 +120,7 @@ def main():
     ap.add_argument("--send", action="append", default=[], help="raw hex command; trailing ? appends checksum")
     ap.add_argument("--rate", type=float, choices=sorted(m.RATE_ARGS), help="send frame-rate command (Hz)")
     ap.add_argument("--set-baud", type=int, choices=sorted(m.BAUD_ARGS),
-                    help="send baud-rate command, then listen at the new rate")
+                    help="set and save the module's baud rate (applies after a power cycle)")
     ap.add_argument("--save", action="store_true", help="send save-to-flash command after the others")
     ap.add_argument("--start", action="store_true",
                     help="send the 'continuous output' command (A5 35 02) before listening")
@@ -151,18 +151,22 @@ def main():
         cmds.append(m.cmd_rate(a.rate))  # float keys hash like ints: 4.0 == 4
     listen_baud = a.baud
     if a.set_baud:
-        # Everything so far plus the baud command goes out at the current rate,
-        # then we reopen at the new rate (and save there, if asked).
-        cmds.append(m.cmd_baud(a.set_baud))
+        # The module takes a new baud rate only from flash after a power cycle. Query mode
+        # first, so it stops streaming (while streaming at 9600 it ignores commands), then the
+        # baud rate and save - while it is still quiet. It powers up in query mode; the server
+        # (and --start) send the automatic-output command at every port open.
+        cmds = [m.CMD_QUERY] * 5 + cmds + [m.cmd_baud(a.set_baud), m.CMD_SAVE]
         fd = m.open_serial(a.dev, a.baud)
-        for c in cmds:
-            print("TX " + binascii.hexlify(c).decode())
-            os.write(fd, c)
-            time.sleep(0.1)
-        os.close(fd)
-        time.sleep(0.5)
-        listen_baud = a.set_baud
-        cmds = []
+        try:
+            for c in cmds:
+                print("TX " + binascii.hexlify(c).decode())
+                os.write(fd, c)
+                time.sleep(0.3)
+        finally:
+            os.close(fd)
+        print("saved %d baud. Power-cycle the module (unplug the UnitV2 for 5 s), then:\n"
+              "  python3 uart_probe.py %s --baud %d" % (a.set_baud, a.dev, a.set_baud))
+        return
     if a.save:
         cmds.append(m.CMD_SAVE)
     listen(a.dev, listen_baud, a.seconds, send=cmds)

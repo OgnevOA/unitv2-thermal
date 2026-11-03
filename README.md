@@ -150,15 +150,27 @@ adds the standard ones so browsers can decode them.
 - **Weak WiFi:** lower **JPEG quality** to about 50 on the page. The RTL8188FU in the UnitV2 is weak: 58 KB/s across the
   room, 131 KB/s next to the router. USB is the most reliable link.
 
-### Faster thermal frames (didn't work here)
+### Faster thermal frames
 
-The module can send 8 Hz at 460800 baud (**Sensor** panel: **→ 460800 baud**, then **8 Hz**, then **Save to module**).
-On this build no frames arrived at 460800, most likely because the UnitV2's UART can't receive cleanly at that rate.
-Stay at 115200 / 4 Hz.
+The module can send 8 Hz only at 460800 baud. 115200 carries at most about 4 frames/s.
+The UnitV2's UART passes a loopback test at 460800, so it should work:
+1. In the **Sensor** panel, press **→ 460800 baud**. This sends the baud command plus save.
+2. **Unplug the UnitV2 for 5 s.** The module applies a new baud rate only after a power cycle.
+3. Press **8 Hz**, then **Save to module**.
 
-Trying it is harmless. If no valid frames arrive for 4 s, the reader asks the module to go back to 115200 and
-switches the UnitV2 side to the other baud rate. The page shows the rate in use (`thermal … @ <baud>`).
-To find the module's rate by hand: `./deploy.sh stop`, then `./deploy.sh probe /dev/ttyS1 --scan`.
+The reader looks for the module at the configured rate, then at 115200, 460800 and 9600, and follows it.
+It never sends baud commands by itself. The page shows the rate in use (`thermal … @ <baud>`).
+
+By hand: `./deploy.sh stop`, then `./deploy.sh probe /dev/ttyS1 --scan` finds the module's rate.
+`./deploy.sh probe /dev/ttyS1 --baud <current> --set-baud 115200` saves a new rate (then power-cycle).
+
+Command codes, from the GY-MCU90640 user manual V1.0:
+- baud `A5 15 01/02/03` = 9600 / 115200 / 460800
+- rate `A5 25 00…04` = 0.5 / 1 / 2 / 4 / 8 Hz
+- `A5 35 01` query mode, `A5 35 02` automatic output
+- `A5 65 01` save
+
+While streaming at 9600 the module ignores commands. Send query mode first, as `--set-baud` does.
 
 ## Phone over USB
 
@@ -263,3 +275,10 @@ No hardware video encoding:
 - The SSD202D's encoder isn't reachable: no `/dev/mi*`, no `libmi_*` libraries, no vendor modules.
 - `/usr/bin/ffmpeg` 4.2.4 has no libx264, and `h264_v4l2m2m` has no device behind it.
 - Storage: 41 MB free of 410 MB flash. RAM: 116 MB.
+
+Serial at boot:
+- The server started at boot often reads nothing from `/dev/ttyS1` at 115200, while the module is streaming;
+  any process started later reads it at once. The cause is unknown: no other reader, nothing in the kernel log.
+- Workaround: if no thermal frame arrives within 30 s of starting, the server exits and `overlay_ctl.sh`
+  starts a fresh one. That's at most 3 times per boot (`/tmp/thermal-overlay.restarts`).
+- Every failed port open is logged with speed, bytes and frames (`./deploy.sh log`).

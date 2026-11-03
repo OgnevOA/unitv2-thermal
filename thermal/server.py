@@ -608,11 +608,12 @@ def make_handler(app):
                 baud = int(body["baud"])
                 if baud not in mlx_uart.BAUD_ARGS:
                     raise ValueError("baud must be one of %s" % sorted(mlx_uart.BAUD_ARGS))
+                # The module applies a new baud rate only from flash after a power cycle,
+                # so save it right away. The reader finds the module at its new rate by itself.
                 app.thermal.send(mlx_uart.cmd_baud(baud))
-                time.sleep(0.4)  # let the reader thread flush the command at the old rate
+                app.thermal.send(mlx_uart.CMD_SAVE)
                 app.cfg.update({"serial_baud": baud})
-                app.apply_config({"serial_baud": baud})
-                sent.append("baud %d (UnitV2 side switched too)" % baud)
+                sent.append("baud %d + save: unplug the UnitV2 for 5 s to apply" % baud)
             return {"ok": True, "sent": sent}
 
         def _small_sndbuf(self):
@@ -712,6 +713,40 @@ def make_handler(app):
     return Handler
 
 
+WATCHDOG_S = 30.0                              # no thermal frame this long after start -> restart
+WATCHDOG_MAX = 3                               # restarts per boot (counted in /tmp, which is RAM)
+WATCHDOG_FILE = "/tmp/thermal-overlay.restarts"
+
+
+def thermal_watchdog(thermal):
+    """Exit (exit code 3) if no thermal frame arrived within WATCHDOG_S of starting.
+
+    On the UnitV2, a server started at boot sometimes reads nothing from the sensor for
+    minutes, while any process started later reads it fine. tools/overlay_ctl.sh restarts
+    the server 3 s after it exits, so this turns that case into a fresh process. Limited
+    per boot, so an unplugged sensor doesn't make it restart forever.
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < WATCHDOG_S:
+        if thermal.latest() is not None:
+            return
+        time.sleep(1.0)
+    try:
+        with open(WATCHDOG_FILE) as f:
+            n = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        n = 0
+    if n >= WATCHDOG_MAX:
+        print("watchdog: still no thermal frames, restart limit (%d) reached" % WATCHDOG_MAX)
+        sys.stdout.flush()
+        return
+    with open(WATCHDOG_FILE, "w") as f:
+        f.write(str(n + 1))
+    print("watchdog: no thermal frame %.0f s after start, restarting (%d/%d)" % (WATCHDOG_S, n + 1, WATCHDOG_MAX))
+    sys.stdout.flush()
+    os._exit(3)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(HERE, "config.json"))
@@ -728,8 +763,11 @@ def main():
     else:
         thermal = mlx_uart.MLXReader(c["serial_dev"], c["serial_baud"], c["checksum"],
                                      init_cmds=[mlx_uart.CMD_START],
-                                     auto_bauds=sorted(mlx_uart.BAUD_ARGS))
+                                     auto_bauds=[c["serial_baud"]] + [b for b in (115200, 460800, 9600)
+                                                                      if b != c["serial_baud"]])
     thermal.start()
+    if not a.demo:
+        threading.Thread(target=thermal_watchdog, args=(thermal,), name="watchdog", daemon=True).start()
     camera = None if a.no_camera else Camera(c["camera"], c["width"], c["height"])
     if camera:
         camera.start()
